@@ -7,11 +7,12 @@ Automatically scans all USDT perpetual futures pairs and alerts you on Telegram 
 Every 60 seconds the scanner:
 
 1. Fetches all USDT perp futures tickers in one API call
-2. Pre-filters to coins that are **up >10% on the day** and **still within 5% of their 24h high** (hasn't retraced yet)
+2. Pre-filters to any **liquid coin** (>$5M 24h volume) that's **still within 5% of its 24h high** — daily gain irrelevant; a flat coin that pumps in the last hour still gets caught
 3. For each candidate, fetches the **15m and 1h chart**
-4. Checks all four conditions for a short setup:
+4. Checks all five conditions for a short setup:
    - RSI(6) ≥ 65 (overbought / elevated)
    - Price within 5% of 24h high (at resistance, not already dumped)
+   - Recent pump ≥ 5% in last 10 candles on that timeframe
    - EMA(7) > EMA(25) > EMA(99) (pump confirmed, all EMAs stacked bullish)
    - MACD histogram > 0 (momentum still up, about to turn)
 5. Sends a Telegram alert when all conditions are met
@@ -67,8 +68,9 @@ Open `scanner.py` and edit the constants at the top:
 
 | Setting | Default | What it does |
 |---|---|---|
-| `MIN_24H_GAIN_PCT` | `10` | Only scan coins up >10% on the day |
-| `MAX_DIST_FROM_HIGH` | `0.05` | Price within 5% of 24h high |
+| `MIN_24H_QUOTE_VOL` | `5_000_000` | Skip illiquid coins — only scan ones with >$5M USDT 24h volume |
+| `MAX_DIST_FROM_HIGH` | `0.05` | Price must be within 5% of 24h high |
+| `MIN_RECENT_PUMP` | `0.05` | Price must have gained ≥5% in last 10 candles |
 | `RSI6_MIN` | `65` | Minimum RSI(6) to trigger alert |
 | `TIMEFRAMES` | `["15m", "1h"]` | Which chart timeframes to check |
 | `SCAN_INTERVAL_SEC` | `60` | How often to scan (seconds) |

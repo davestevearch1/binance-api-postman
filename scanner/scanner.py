@@ -34,11 +34,12 @@ FUTURES_BASE = "https://fapi.binance.com"
 TIMEFRAMES = ["15m", "1h"]
 
 # ── Strategy thresholds (adjust to taste) ────────────────────────────────────
-MIN_24H_GAIN_PCT   = 10    # Only scan coins up >10% on the day
-MAX_DIST_FROM_HIGH = 0.05  # Price must be within 5% of 24h high
-RSI6_MIN           = 65    # RSI(6) must be >= this (65=elevated, 75=clearly overbought)
-REQUIRE_EMA_STACK  = True  # EMA7 > EMA25 > EMA99 (stacked bullish = overextended pump)
-REQUIRE_MACD_POS   = True  # MACD histogram must be positive
+MIN_24H_QUOTE_VOL  = 5_000_000  # Only scan coins with >$5M USDT 24h volume (liquidity filter)
+MAX_DIST_FROM_HIGH = 0.05       # Price must be within 5% of 24h high
+MIN_RECENT_PUMP    = 0.05       # Price must have gained >=5% in the last 10 candles (recent pump)
+RSI6_MIN           = 65         # RSI(6) must be >= this (65=elevated, 75=clearly overbought)
+REQUIRE_EMA_STACK  = True       # EMA7 > EMA25 > EMA99 (stacked bullish = overextended pump)
+REQUIRE_MACD_POS   = True       # MACD histogram must be positive
 
 # ── Scanner behaviour ─────────────────────────────────────────────────────────
 SCAN_INTERVAL_SEC  = 60    # Full scan every 60 seconds
@@ -122,8 +123,9 @@ def check_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> dict |
     Conditions (all must pass):
       1. RSI(6) >= RSI6_MIN          — overbought or elevated
       2. Price within 5% of 24h high — at obvious resistance, hasn't retraced yet
-      3. EMA(7) > EMA(25) > EMA(99)  — pump confirmed, all EMAs stacked bullish
-      4. MACD histogram > 0          — momentum still up (about to turn)
+      3. Recent pump >= MIN_RECENT_PUMP — price gained on the chart timeframe itself
+      4. EMA(7) > EMA(25) > EMA(99)  — pump confirmed, all EMAs stacked bullish
+      5. MACD histogram > 0          — momentum still up (about to turn)
     """
     c = df["close"]
 
@@ -154,6 +156,13 @@ def check_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> dict |
     if dist_pct > MAX_DIST_FROM_HIGH:
         return None
 
+    # Recent pump on this chart timeframe (last 10 closed candles)
+    lookback = min(10, len(c) - 2)
+    past_price = c.iloc[i - lookback]
+    recent_pump = (price - past_price) / past_price if past_price > 0 else 0
+    if recent_pump < MIN_RECENT_PUMP:
+        return None
+
     if REQUIRE_EMA_STACK and not (e7 > e25 > e99):
         return None
 
@@ -161,31 +170,35 @@ def check_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> dict |
         return None
 
     return {
-        "symbol":    symbol,
-        "timeframe": tf,
-        "price":     price,
-        "high24":    high24,
-        "change24":  float(ticker["priceChangePercent"]),
-        "dist_pct":  round(dist_pct * 100, 2),
-        "rsi6":      round(r6, 2),
-        "rsi12":     round(r12, 2),
-        "rsi24":     round(r24, 2),
-        "ema7":      round(e7, 8),
-        "ema25":     round(e25, 8),
-        "ema99":     round(e99, 8),
-        "macd_hist": round(mh, 8),
+        "symbol":      symbol,
+        "timeframe":   tf,
+        "price":       price,
+        "high24":      high24,
+        "change24":    float(ticker["priceChangePercent"]),
+        "quote_vol":   float(ticker["quoteVolume"]),
+        "dist_pct":    round(dist_pct * 100, 2),
+        "recent_pump": round(recent_pump * 100, 2),
+        "rsi6":        round(r6, 2),
+        "rsi12":       round(r12, 2),
+        "rsi24":       round(r24, 2),
+        "ema7":        round(e7, 8),
+        "ema25":       round(e25, 8),
+        "ema99":       round(e99, 8),
+        "macd_hist":   round(mh, 8),
     }
 
 
 def format_alert(s: dict) -> str:
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    vol_m = s["quote_vol"] / 1_000_000
     return (
         f"🔴 <b>SHORT SETUP — {s['symbol']}</b>  [{s['timeframe']}]\n"
         f"{ts}\n"
         f"\n"
         f"Price:      <b>{s['price']}</b>\n"
         f"24h High:   {s['high24']}  ({s['dist_pct']}% below — near top)\n"
-        f"24h Change: +{s['change24']}% (pump in progress)\n"
+        f"24h Change: {s['change24']:+.2f}%   |  24h Vol: ${vol_m:.1f}M\n"
+        f"Recent pump: +{s['recent_pump']}% (last 10 candles on {s['timeframe']})\n"
         f"\n"
         f"RSI(6):  <b>{s['rsi6']}</b>  |  RSI(12): {s['rsi12']}  |  RSI(24): {s['rsi24']}\n"
         f"EMA7:    {s['ema7']}\n"
@@ -203,13 +216,14 @@ def run_scan(tickers: list[dict]) -> None:
     now = time.time()
 
     # Step 1: fast pre-filter using ticker data only (no extra API calls)
+    # Keeps any liquid coin sitting near its 24h high, regardless of daily gain.
     candidates = []
     for t in tickers:
         try:
-            chg    = float(t["priceChangePercent"])
-            price  = float(t["lastPrice"])
-            high24 = float(t["highPrice"])
-            if chg < MIN_24H_GAIN_PCT:
+            price     = float(t["lastPrice"])
+            high24    = float(t["highPrice"])
+            quote_vol = float(t["quoteVolume"])
+            if quote_vol < MIN_24H_QUOTE_VOL:
                 continue
             if high24 <= 0:
                 continue
@@ -220,8 +234,9 @@ def run_scan(tickers: list[dict]) -> None:
             pass
 
     log.info(
-        "Pre-filter: %d/%d coins are up >%d%% and still within %d%% of 24h high",
-        len(candidates), len(tickers), MIN_24H_GAIN_PCT, int(MAX_DIST_FROM_HIGH * 100),
+        "Pre-filter: %d/%d coins have >$%.1fM vol and are within %d%% of 24h high",
+        len(candidates), len(tickers), MIN_24H_QUOTE_VOL / 1_000_000,
+        int(MAX_DIST_FROM_HIGH * 100),
     )
 
     # Step 2: detailed chart analysis on candidates only
@@ -239,8 +254,8 @@ def run_scan(tickers: list[dict]) -> None:
                 sig = check_signal(df, ticker, symbol, tf)
                 if sig:
                     log.info(
-                        "SIGNAL  %-15s [%3s]  RSI6=%-5.1f  +%.1f%%  %.2f%% from high",
-                        symbol, tf, sig["rsi6"], sig["change24"], sig["dist_pct"],
+                        "SIGNAL  %-15s [%3s]  RSI6=%-5.1f  pump=+%.1f%%  %.2f%% from high",
+                        symbol, tf, sig["rsi6"], sig["recent_pump"], sig["dist_pct"],
                     )
                     send_telegram(format_alert(sig))
                     _alerted[key] = now
@@ -257,9 +272,10 @@ def main() -> None:
     log.info("=" * 60)
     log.info("Binance Perp Futures Short Scanner")
     log.info("Timeframes : %s", TIMEFRAMES)
-    log.info("Filter     : 24h gain > %d%%,  within %d%% of 24h high",
-             MIN_24H_GAIN_PCT, int(MAX_DIST_FROM_HIGH * 100))
-    log.info("Signal     : RSI(6) >= %d,  EMA stack,  MACD+", RSI6_MIN)
+    log.info("Filter     : 24h vol > $%.1fM,  within %d%% of 24h high",
+             MIN_24H_QUOTE_VOL / 1_000_000, int(MAX_DIST_FROM_HIGH * 100))
+    log.info("Signal     : RSI(6) >= %d,  recent pump >= %d%%,  EMA stack,  MACD+",
+             RSI6_MIN, int(MIN_RECENT_PUMP * 100))
     if not TELEGRAM_TOKEN:
         log.warning("TELEGRAM_TOKEN not set — alerts print to console only")
     log.info("=" * 60)
